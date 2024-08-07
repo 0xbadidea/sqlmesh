@@ -893,6 +893,7 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
         if end_bounded:
             execution_time = min(to_timestamp(execution_time), end_ts)
 
+        """
         if not allow_partials:
             upper_bound_ts = to_timestamp(
                 self.node.cron_floor(execution_time) if not ignore_cron else execution_time
@@ -901,16 +902,39 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
         else:
             upper_bound_ts = to_timestamp(execution_time)
             end_ts = min(end_ts, upper_bound_ts)
+        """
 
         lookback = 0
+        model_start_ts: t.Optional[int] = None
         model_end_ts: t.Optional[int] = None
 
         if self.is_model:
             lookback = self.model.lookback
-            model_end_ts = (
-                to_timestamp(make_inclusive_end(self.model.end)) if self.model.end else None
-            )
+            if self.model.start:
+                model_start_ts = to_timestamp(self.model.start)
 
+            if self.model.end:
+                # this is the model end timestamp in "interval" time
+                # for example, a model.end of "2023-01-05" should be treated as `2023-01-06 00:00:00` when comparing against intervals
+                # and not `2023-01-05 23:59:59.999`
+                model_end_ts = to_timestamp(
+                    make_inclusive_end(self.model.end) + timedelta(microseconds=1)
+                )
+
+        return compute_missing_intervals2(
+            interval_unit,
+            interval_unit.cron_expr if ignore_cron else self.node.cron,
+            tuple(intervals),
+            to_datetime(start_ts),
+            to_datetime(end_ts),
+            to_datetime(execution_time),
+            lookback,
+            to_datetime(model_start_ts) if model_start_ts else None,
+            to_datetime(model_end_ts) if model_end_ts else None,
+            allow_partials,
+        )
+
+        """
         return compute_missing_intervals(
             interval_unit,
             tuple(intervals),
@@ -920,6 +944,7 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             lookback,
             model_end_ts,
         )
+        """
 
     def categorize_as(self, category: SnapshotChangeCategory) -> None:
         """Assigns the given category to this snapshot.
@@ -1713,6 +1738,58 @@ def compute_missing_intervals(
                 missing.append((current_ts, next_ts))
 
     return missing
+
+
+@lru_cache(maxsize=None)
+def compute_missing_intervals2(
+    interval_unit: IntervalUnit,
+    model_cron: str,
+    intervals: t.Tuple[Interval, ...],
+    start: datetime,
+    end: datetime,
+    upper_bound: datetime,
+    lookback: int,
+    model_start: t.Optional[datetime],
+    model_end: t.Optional[datetime],
+    allow_partials: bool,
+) -> Intervals:
+    """Computes all missing intervals between start and end given intervals."""
+
+    from sqlmesh.core.snapshot.intervals import Intervals, Interval
+
+    if end == start:
+        return []
+
+    current_time = upper_bound
+    requested_start = start
+    requested_end = end
+
+    if allow_partials and end > interval_unit.cron_floor(end):
+        requested_end = interval_unit.cron_next(end)
+        current_time = requested_end
+
+    full_range = Intervals(
+        cron=model_cron,
+        start=model_start or start,
+        end=max(upper_bound, requested_end),
+        interval_unit=interval_unit,
+    )
+    full_range.mark_present(intervals)
+
+    # TODO: optimise, often we generate a bunch of unnecessary intervals
+    missing = full_range.missing(
+        current_time=current_time, lookback=lookback, cutoff_time=model_end
+    )
+
+    # prune the missing intervals to just what was requested, taking into account things like partials
+    requested_range = Interval(start=requested_start, end=requested_end)
+    missing_in_requested_range = [i for i in missing if i in requested_range]
+
+    if upper_bound < requested_end and len(missing_in_requested_range) > 0:
+        # truncate the end date of the last interval to be the upper bound
+        missing_in_requested_range[-1].end = upper_bound
+
+    return [i.to_primitive() for i in missing_in_requested_range]
 
 
 def earliest_start_date(

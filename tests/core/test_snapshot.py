@@ -3,6 +3,7 @@ import typing as t
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
+import freezegun
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
@@ -334,6 +335,53 @@ def test_missing_intervals_end_bounded_with_lookback(make_snapshot):
     )
 
 
+def test_missing_intervals_with_lookback_consistent_between_plan_and_run(make_snapshot):
+    snapshot: Snapshot = make_snapshot(
+        SqlModel(
+            name="test4",
+            kind=IncrementalByTimeRangeKind(time_column="ds", lookback=2),
+            cron="0 12 * * *",
+            start="2024-08-01",
+            query=parse_one("SELECT ds FROM parent.tbl"),
+        )
+    )
+
+    snapshot.add_interval("2024-08-01", "2024-08-05")
+    assert snapshot.intervals == [(1722470400000, 1722902400000)]
+
+    # simulates `sqlmesh plan`
+
+    # because cron=12pm, the interval for the 6th shouldnt be filled until after 12pm on the 7th
+    # since its only 4am on the 7th, the interval for the 6th should not be filled yet
+    # which means this model is fully backfilled because we have intervals for 1st -> 5th (inclusive)
+    with freezegun.freeze_time("2024-08-07 04:25:00"):
+        assert (
+            snapshot.missing_intervals(
+                start=to_datetime("2024-08-01"),
+                end=1722988800000,  # datetime.datetime(2024, 8, 7, 0, 0, tzinfo=datetime.timezone.utc)
+                # end=to_timestamp("2024-08-06"), - works
+                execution_time=None,
+                deployability_index=DeployabilityIndex.all_deployable(),
+                ignore_cron=False,
+                end_bounded=True,
+            )
+            == []
+        )
+
+    # simulate sqlmesh run
+    assert (
+        snapshot.missing_intervals(
+            start=to_datetime("2024-08-01"),
+            end=to_datetime("2024-08-07 04:29:00"),
+            execution_time=to_datetime("2024-08-07 04:29:00"),
+            deployability_index=DeployabilityIndex.all_deployable(),
+            ignore_cron=False,
+            end_bounded=False,
+        )
+        == []
+    )
+
+
 def test_missing_intervals_end_bounded_with_ignore_cron(make_snapshot):
     snapshot = make_snapshot(
         SqlModel(
@@ -431,6 +479,10 @@ def test_missing_intervals_past_end_date_with_lookback(make_snapshot):
         (to_timestamp("2023-01-05"), to_timestamp("2023-01-06")),
     ]
 
+    # simulate sqlmesh run for end date + 1 day (2023-01-07)
+    # this fills 2023-01-04 and 2023-01-05
+    snapshot.add_interval("2023-01-04", "2023-01-05")
+
     # running on the end date + 2 days (2023-01-08)
     # 2023-01-07 "would" run and since lookback=2 this pulls in 2023-01-06 and 2023-01-05 as well
     # however, only 2023-01-05 is within the model end date
@@ -447,6 +499,51 @@ def test_missing_intervals_past_end_date_with_lookback(make_snapshot):
     # running way in the future, no missing intervals because subtracting 2 days for lookback still exceeds the models end date
     end_time = to_timestamp("2024-01-01")
     assert snapshot.missing_intervals(start_time, end_time, execution_time=end_time) == []
+
+
+def test_missing_intervals_with_end_date_and_lookback_consistent_between_plan_and_run(
+    make_snapshot,
+):
+    snapshot: Snapshot = make_snapshot(  # type: ignore
+        SqlModel(
+            name="test4",
+            kind=IncrementalByTimeRangeKind(time_column=TimeColumn(column="ds"), lookback=2),
+            cron="@daily",
+            query=parse_one("SELECT 1, ds FROM name"),
+            start="2024-07-01",
+            end="2024-07-29",
+        )
+    )
+
+    snapshot.add_interval(to_timestamp("2024-07-01"), to_timestamp("2024-07-30"))
+    assert snapshot.intervals == [(1719792000000, 1722297600000)]
+
+    # simulate sqlmesh plan
+    with freezegun.freeze_time("2024-08-07 03:45:00"):
+        assert (
+            snapshot.missing_intervals(
+                start=to_datetime("2023-07-01"),
+                end="2024-07-29",
+                execution_time=None,
+                deployability_index=DeployabilityIndex.all_deployable(),
+                ignore_cron=False,
+                end_bounded=True,
+            )
+            == []
+        )
+
+    # simulate sqlmesh run
+    assert (
+        snapshot.missing_intervals(
+            start=to_datetime("2023-07-01"),
+            end="2024-07-29",
+            execution_time=to_datetime("2024-08-07 03:59:00"),
+            deployability_index=DeployabilityIndex.all_deployable(),
+            ignore_cron=False,
+            end_bounded=False,
+        )
+        == []
+    )
 
 
 def test_incremental_time_self_reference(make_snapshot):
@@ -485,6 +582,7 @@ def test_lookback(snapshot: Snapshot, make_snapshot):
         )
     )
 
+    # first data interval always included
     assert snapshot.missing_intervals("2023-01-01", "2023-01-01") == [
         (to_timestamp("2023-01-01"), to_timestamp("2023-01-02")),
     ]
@@ -493,55 +591,100 @@ def test_lookback(snapshot: Snapshot, make_snapshot):
     assert snapshot.missing_intervals("2023-01-01", "2023-01-02") == []
 
     snapshot.add_interval("2023-01-06", "2023-01-07")
+
+    # (2023-01-03 00:00:00 -> 2023-01-04 00:00:00) is showing as missing because:
+    #  - the interval (2023-01-05 00:00:00 -> 2023-01-06 00:00:00) is missing
+    #  - lookback=2
+    # (2023-01-04 -> 2023-01-05) is also missing but it doesnt show because it starts after the requested end time of 2023-01-04 00:00:00
     assert snapshot.missing_intervals("2023-01-03", "2023-01-03") == [
         (to_timestamp("2023-01-03"), to_timestamp("2023-01-04")),
     ]
+
+    # (2023-01-04 00:00:00 -> 2023-01-05 00:00:00) is showing as missing because:
+    #  - the interval (2023-01-05 00:00:00 -> 2023-01-06 00:00:00) is missing
+    #  - lookback=2
+    # (2023-01-03 -> 2023-01-04) is also still missing but it doesnt show because it's before the requested start time of 2023-01-04 00:00:00
     assert snapshot.missing_intervals("2023-01-04", "2023-01-04") == [
         (to_timestamp("2023-01-04"), to_timestamp("2023-01-05")),
     ]
+
+    # (2023-01-05 00:00:00 -> 2023-01-06 00:00:00) is showing as missing because:
+    #  - it's legitimately missing, it hasnt been added to the snapshot as a filled interval
+    # (2023-01-03 00:00:00 -> 2023-01-04 00:00:00), (2023-01-04 00:00:00 -> 2023-01-05 00:00:00) are also still missing but they dont show
+    # because theyre before the requested start time of 2023-01-05 00:00:00
     assert snapshot.missing_intervals("2023-01-05", "2023-01-05") == [
         (to_timestamp("2023-01-05"), to_timestamp("2023-01-06")),
     ]
+
+    # Now we widen the requested time range to show that these intervals are all still missing
     assert snapshot.missing_intervals("2023-01-03", "2023-01-05") == [
         (to_timestamp("2023-01-03"), to_timestamp("2023-01-04")),
         (to_timestamp("2023-01-04"), to_timestamp("2023-01-05")),
         (to_timestamp("2023-01-05"), to_timestamp("2023-01-06")),
     ]
+
+    # Now we fill our missing interval of 2023-01-05 00:00:00 -> 2023-01-06 00:00:00
     snapshot.add_interval("2023-01-05", "2023-01-05")
+
+    # The intervals for 2023-01-03 -> 2023-01-05 are no longer missing
+    # however, 2023-01-06 is showing as missing (even though its been filled) because:
+    # - 2023-01-08 is missing
+    # - lookback=2
+    # - which tags 2023-01-07 and 2023-01-06 as missing
+    # However, only the interval for 2023-01-06 shows because the interval for 2023-01-07 is after the requested end time
     assert snapshot.missing_intervals("2023-01-03", "2023-01-06") == [
         (to_timestamp("2023-01-06"), to_timestamp("2023-01-07")),
     ]
 
+    # Now we switch to a different time range
+    # This interval is legitimately missing but we have only requested the range (2023-01-29 00:00:00 -> 2023-01-30 00:00:00)
+    # so it only returns this interval and not any prior ones even though lookback=2
     assert snapshot.missing_intervals("2023-01-29", "2023-01-29") == [
         (to_timestamp("2023-01-29"), to_timestamp("2023-01-30")),
     ]
 
+    # Now we fill intervals for 2023-01-28 and 2023-01-29
     snapshot.add_interval("2023-01-28", "2023-01-29")
+
+    # at 2023-01-30 05:00:00, that's when we can process 2023-01-29 00:00:00 -> 2023-01-30 00:00:00
+    # however, its already been marked as filled
+    # but, since lookback=2, the interval for 2023-01-28 is marked as missing
+    # - which highlights the gap between 2023-01-08 -> 2023-01-28
+    # - which causes every interval from 2023-01-08 -> now to be marked as missing due to the viral nature of lookback
+    # but, we only requested the range 2023-01-27 00:00:00 -> 2023-08-28 00:00:00 so this is the only missing interval returned
     assert snapshot.missing_intervals("2023-01-27", "2023-01-27", "2023-01-30 05:00:00") == [
         (to_timestamp("2023-01-27"), to_timestamp("2023-01-28")),
     ]
+    # as above but we only request the intervals between 2023-01-28 00:00:00 and 2023-01-29 00:00:00
     assert snapshot.missing_intervals("2023-01-28", "2023-01-28", "2023-01-30 05:00:00") == [
         (to_timestamp("2023-01-28"), to_timestamp("2023-01-29")),
     ]
+    # as above but we only request the intervals between 2023-01-29 00:00:00 and 2023-01-30 00:00:00
     assert snapshot.missing_intervals("2023-01-29", "2023-01-29", "2023-01-30 05:00:00") == [
         (to_timestamp("2023-01-29"), to_timestamp("2023-01-30")),
     ]
+    # as above but we widen our range to request the intervals between 2023-01-27 00:00:00 and 2023-01-30 00:00:00
+    # which shows that all these intervals are missing due to lookback even though 2023-01-28 and 2023-01-29 have been marked as present
     assert snapshot.missing_intervals("2023-01-27", "2023-01-29", "2023-01-30 05:00:00") == [
         (to_timestamp("2023-01-27"), to_timestamp("2023-01-28")),
         (to_timestamp("2023-01-28"), to_timestamp("2023-01-29")),
         (to_timestamp("2023-01-29"), to_timestamp("2023-01-30")),
     ]
 
+    # now we mark 2023-01-28, 2023-01-29 and 2023-01-30 as present
     snapshot.add_interval("2023-01-28", "2023-01-30")
+    # 2023-01-27 is missing because it simply hasnt been filled and its within the requested time range
     assert snapshot.missing_intervals("2023-01-27", "2023-01-27", "2023-01-30 05:00:00") == [
         (to_timestamp("2023-01-27"), to_timestamp("2023-01-28")),
     ]
+
+    # TODO: I think everything below here is wrong. these should show all intervals in the requested range as unfilled
+    # due to the gap in the model after 2023-01-08 which essentially invalidates all intervals after it thanks to lookback
     assert snapshot.missing_intervals("2023-01-28", "2023-01-28", "2023-01-30 05:00:00") == []
     assert snapshot.missing_intervals("2023-01-29", "2023-01-29", "2023-01-30 05:00:00") == []
     assert snapshot.missing_intervals("2023-01-27", "2023-01-29", "2023-01-30 05:00:00") == [
         (to_timestamp("2023-01-27"), to_timestamp("2023-01-28")),
     ]
-
     assert snapshot.missing_intervals("2023-01-30", "2023-01-30", "2023-01-30") == []
 
 
